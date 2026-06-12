@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          submodules: recursive
 
       # See https://github.com/rust-lang/rust/issues/148431
       - name: Use Rust 1.93 for documentation
@@ -47,6 +49,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          submodules: recursive
 
       - name: Cache setup
         uses: ./.github/actions/cache-setup
@@ -64,60 +68,20 @@ jobs:
         run: cargo sort --workspace --check
 
   build:
-    name: Build
+    name: Build (${{ matrix.name }})
     runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: glibc
+            target: ""
+            musl: false
 
-      - name: Cache setup
-        uses: ./.github/actions/cache-setup
-
-      - name: Build all targets
-        run: cargo build --workspace --all-targets --locked
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Cache setup
-        uses: ./.github/actions/cache-setup
-
-      - name: Run tests
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          sudo -E \
-            PATH="$PATH:/usr/share/rust/.cargo/bin" \
-            bash -c '
-              set -euo pipefail
-
-              ulimit -Sl 512
-              ulimit -Hl 512
-
-              echo "$(nproc) CPU(s) available"
-              echo "PATH=$PATH"
-              command -v rustup
-              command -v cargo
-              rustup show
-
-              exec cargo test -- --test-threads="$(nproc)"
-            '
-
-  build-musl:
-    name: Build and test musl
-    runs-on: ubuntu-latest
-
-    env:
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-      CC_x86_64_unknown_linux_musl: musl-gcc
-      AR_x86_64_unknown_linux_musl: ar
+          - name: musl
+            target: x86_64-unknown-linux-musl
+            musl: true
 
     steps:
       - name: Checkout
@@ -125,60 +89,64 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install musl toolchain and Linux UAPI headers
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          sudo apt-get update
-          sudo apt-get install --yes \
-            build-essential \
-            musl-tools \
-            linux-libc-dev
-
-          rustup target add x86_64-unknown-linux-musl
-
-          musl_include=/usr/include/x86_64-linux-musl
-
-          sudo ln -sfn /usr/include/linux \
-            "${musl_include}/linux"
-
-          sudo ln -sfn /usr/include/asm-generic \
-            "${musl_include}/asm-generic"
-
-          sudo ln -sfn /usr/include/x86_64-linux-gnu/asm \
-            "${musl_include}/asm"
-
-          printf '#include <linux/swab.h>\n' |
-            musl-gcc -E -x c - >/dev/null
-
-          printf '#include <linux/io_uring.h>\n' |
-            musl-gcc -E -x c - >/dev/null
+      - name: Set up musl
+        if: matrix.musl
+        uses: ./.github/actions/setup-musl
 
       - name: Cache setup
         uses: ./.github/actions/cache-setup
 
       - name: Build all targets
-        run: cargo build --workspace --all-targets --locked --target x86_64-unknown-linux-musl
-
-      - name: Run tests
         shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
 
-          sudo -E \
-            PATH="$PATH:/usr/share/rust/.cargo/bin" \
-            bash -c '
-              set -euo pipefail
+          args=(
+            build
+            --workspace
+            --all-targets
+            --locked
+          )
 
-              ulimit -Sl 512
-              ulimit -Hl 512
+          if [[ -n "${TARGET}" ]]; then
+            args+=(--target "${TARGET}")
+          fi
 
-              echo "$(nproc) CPU(s) available"
-              echo "PATH=$PATH"
-              command -v rustup
-              command -v cargo
-              rustup show
+          cargo "${args[@]}"
 
-              exec cargo test --target x86_64-unknown-linux-musl -- --test-threads="$(nproc)"
-            '
+  test:
+    name: Test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: glibc
+            target: ""
+            musl: false
+
+          - name: musl
+            target: x86_64-unknown-linux-musl
+            musl: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Set up musl
+        if: matrix.musl
+        uses: ./.github/actions/setup-musl
+
+      - name: Cache setup
+        uses: ./.github/actions/cache-setup
+
+      - name: Run tests
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: .github/scripts/run-tests.sh "${TARGET}"
