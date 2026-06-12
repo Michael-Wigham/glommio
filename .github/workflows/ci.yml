@@ -4,92 +4,181 @@ permissions: write-all
 
 on:
   pull_request:
-    branches: [ main ]
-    types: [ "opened", "synchronize" ]
+    branches: [main]
+    types: [opened, synchronize, reopened]
   push:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
-
   doc:
+    name: Documentation
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
+
+      # See https://github.com/rust-lang/rust/issues/148431
+      - name: Use Rust 1.93 for documentation
+        run: rustup override set 1.93.0
 
       - name: Cache setup
         uses: ./.github/actions/cache-setup
 
       - name: Install cargo-deadlinks
-        run: which deadlinks || cargo install cargo-deadlinks
+        run: which cargo-deadlinks || cargo install --locked cargo-deadlinks
 
       - name: Generate documentation
-        run: cargo doc --all
+        env:
+          RUSTDOCFLAGS: >-
+            --cfg zerocopy_unstable_ptr
+            -D rustdoc::broken_intra_doc_links
+        run: |
+          cargo clean --doc
+          cargo doc --workspace --all-features --locked
 
       - name: Validate links
         run: cargo deadlinks --dir target/doc/glommio
 
   lint:
+    name: Lint
     runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v3
-    - name: Cache setup
-      uses: ./.github/actions/cache-setup
-    - run: cargo fmt --all -- --check
-    - run: cargo clippy --all --all-targets --all-features
-    - run: cargo install cargo-sort
-    - run: cargo sort -w -c 
 
-  build:
-    runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
+
+      - name: Cache setup
+        uses: ./.github/actions/cache-setup
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked
+
+      - name: Install cargo-sort
+        run: which cargo-sort || cargo install --locked cargo-sort
+
+      - name: Check Cargo.toml ordering
+        run: cargo sort --workspace --check
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
 
       - name: Cache setup
         uses: ./.github/actions/cache-setup
 
       - name: Build all targets
-        run: cargo build --all --all-targets
+        run: cargo build --workspace --all-targets --locked
 
   test:
+    name: Test
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
 
       - name: Cache setup
         uses: ./.github/actions/cache-setup
 
-      - name: Install cargo helpers and test all targets
+      - name: Run tests
+        shell: bash
         run: |
-          cat << EOF > "run-gha-workflow.sh"
-          PATH=$PATH:/usr/share/rust/.cargo/bin
-          echo "`nproc` CPU(s) available"
-          rustup install 1.92
-          rustup show
-          rustup default stable
-          cargo install cargo-sort
-          cargo test -- --test-threads=`nproc`
-          EOF
-          sudo -E bash -c "ulimit -Sl 512 && ulimit -Hl 512 && bash run-gha-workflow.sh"
+          set -euo pipefail
+
+          sudo -E \
+            PATH="$PATH:/usr/share/rust/.cargo/bin" \
+            bash -c '
+              set -euo pipefail
+
+              ulimit -Sl 512
+              ulimit -Hl 512
+
+              echo "$(nproc) CPU(s) available"
+              echo "PATH=$PATH"
+              command -v rustup
+              command -v cargo
+              rustup show
+
+              exec cargo test -- --test-threads="$(nproc)"
+            '
 
   build-musl:
+    name: Build and test musl
     runs-on: ubuntu-latest
+
+    env:
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      AR_x86_64_unknown_linux_musl: ar
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
         with:
           submodules: recursive
 
-      - name: Install cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
+      - name: Install musl toolchain and Linux UAPI headers
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Build for musl target
-        run: cross build --target x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            musl-tools \
+            linux-libc-dev
 
-      - name: Run tests for musl target
-        continue-on-error: true
-        run: cross test --target x86_64-unknown-linux-musl -- --test-threads=$(nproc) --skip io::dma_file::test
+          rustup target add x86_64-unknown-linux-musl
+
+          musl_include=/usr/include/x86_64-linux-musl
+
+          sudo ln -sfn /usr/include/linux \
+            "${musl_include}/linux"
+
+          sudo ln -sfn /usr/include/asm-generic \
+            "${musl_include}/asm-generic"
+
+          sudo ln -sfn /usr/include/x86_64-linux-gnu/asm \
+            "${musl_include}/asm"
+
+          printf '#include <linux/swab.h>\n' |
+            musl-gcc -E -x c - >/dev/null
+
+          printf '#include <linux/io_uring.h>\n' |
+            musl-gcc -E -x c - >/dev/null
+
+      - name: Cache setup
+        uses: ./.github/actions/cache-setup
+
+      - name: Build all targets
+        run: cargo build --workspace --all-targets --locked --target x86_64-unknown-linux-musl
+
+      - name: Run tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo -E \
+            PATH="$PATH:/usr/share/rust/.cargo/bin" \
+            bash -c '
+              set -euo pipefail
+
+              ulimit -Sl 512
+              ulimit -Hl 512
+
+              echo "$(nproc) CPU(s) available"
+              echo "PATH=$PATH"
+              command -v rustup
+              command -v cargo
+              rustup show
+
+              exec cargo test --target x86_64-unknown-linux-musl -- --test-threads="$(nproc)"
+            '
